@@ -1,1 +1,506 @@
-567
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+视频描述评估脚本
+使用OpenAI API作为裁判，对比GT和预测结果，针对7个维度进行Y/N/F评估
+支持多线程并行评估
+"""
+
+import json
+import re
+import os
+import time
+from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+
+from openai import OpenAI
+
+# OpenAI API配置
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")  # 从环境变量获取，或直接填写
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:8010/v1")  # 默认官方API，可使用代理
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "/data/models/Qwen3-VL/Qwen3-VL-32B-Instruct")  # 使用的模型，如 gpt-4o, gpt-4-turbo, gpt-3.5-turbo 等
+# OPENAI_MODEL = os.getenv("OPENAI_MODEL", "/data/models/Qwen3/Qwen3-30B-A3B-Instruct-2507")  # 使用的模型，如 gpt-4o, gpt-4-turbo, gpt-3.5-turbo 等
+
+if not OPENAI_API_KEY:
+    print("警告: 未设置 OPENAI_API_KEY 环境变量，请确保已在代码中配置或设置环境变量")
+# 文件路径配置
+GT_FILE = "/home/ma-user/work/d1479486/eval/video_labels_1000.json"
+
+NAME = "recaps_wan22_14B_golden_rule_2_broken"
+PRED_FILE = f"/home/ma-user/work/d1479486/eval/{NAME}.json"
+#PRED_FILE = "/home/ma-user/work/d1479486/eval/test.json"
+OUTPUT_FILE = f"/home/ma-user/work/d1479486/eval/eval_results_{NAME}.json"
+
+# 多线程配置
+MAX_WORKERS = 32  # 并发线程数
+print_lock = Lock()  # 用于线程安全的打印
+
+def call_openai_api(prompt_text: str, max_retries: int = 3) -> Optional[str]:
+    """
+    调用OpenAI API获取评估结果
+    
+    Args:
+        prompt_text: 评估prompt
+        max_retries: 最大重试次数
+        
+    Returns:
+        模型返回的文本，失败返回None
+    """
+    client = OpenAI(
+        api_key=OPENAI_API_KEY,
+        base_url=OPENAI_BASE_URL
+    )
+    
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "user", "content": prompt_text}
+                ],
+                max_tokens=1024,  # 7个维度需要足够token
+                temperature=0,
+                timeout=60
+            )
+            
+            # 提取返回的文本
+            if response.choices and len(response.choices) > 0:
+                text_value = response.choices[0].message.content
+                if text_value:
+                    return text_value.strip()
+                
+        except Exception as e:
+            with print_lock:
+                print(f"API调用失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2)  # 等待后重试
+    
+    return None
+
+def build_evaluation_prompt(video_id: str, gt_data: Dict, pred_text: str) -> str:
+    """
+    构建评估prompt（7个维度：Subject, Attributes, Action, Environment, Camera_Tech, Surroundings, Summary）
+    
+    Args:
+        video_id: 视频ID
+        gt_data: GT数据字典
+        pred_text: 模型预测的文本
+        
+    Returns:
+        构建好的prompt文本
+    """
+    # 构建GT的结构化信息（7个维度，不包括Caption）
+    gt_subject = gt_data.get("Subject_Info", "N/A")
+    gt_attributes = gt_data.get("Attributes", "N/A")
+    gt_action = gt_data.get("Action", "N/A")
+    gt_environment_static = gt_data.get("Environment_Static", "N/A")
+    gt_camera_tech = gt_data.get("Camera_Tech", "N/A")
+    gt_surroundings = gt_data.get("Surroundings", "N/A")
+    gt_summary = gt_data.get("Summary", "N/A")
+    prompt = f"""你是一个客观的视频描述评估员。请评估预测文本 (Pred) 是否准确涵盖了标准参考 (GT) 中的**核心信息**。
+
+### 判定逻辑 (适度标准) ###
+
+**核心原则**
+- ，Pred 必须准确描述出**主要的主体**、**主要的动作**和**关键的环境特征**。
+
+1. **【Y - 合格 (Pass)】**
+   - **定义**：Pred 涵盖了 GT 的**主要内容**，且没有关键错误。
+   - **标准**：
+     - **主体**：正确识别了主要角色（例如 GT是“两只狗”，Pred是“两只狗”或“狗群” -> Y；Pred是“一只动物” -> F）。
+     - **细节**：允许遗漏次要的修饰词（例如 GT是“红色丝绸裙子”，Pred是“红色裙子”或“裙子” -> Y。但如果裙子是画面的核心，Pred只写“衣服” -> F）。
+     - **动作**：捕捉到了动作的主要意图（例如 GT是“快速冲刺并跳跃”，Pred是“在跑” -> Y，因为核心是移动）。
+
+2. **【N - 错误 (Contradiction)】**
+   - **定义**：Pred 的描述与 GT **明显矛盾**或存在**幻觉**。
+   - **标准**：
+     - 事实性错误（如：男变女，白天变黑夜，跑变坐）。
+     - 出现了 GT 中完全没有的物体或动作。
+
+3. **【F - 缺失/模糊 (Missing/Vague)】**
+   - **定义**：Pred 遗漏了**核心**信息，或者描述**过于笼统**，无法区分场景。
+   - **标准**：
+     - **核心丢失**：GT 有两个主要人物在互动，Pred 只提到了一个人 -> F。
+     - **过度概括**：GT 是“金毛犬在草地上接飞盘”，Pred 是“狗在户外玩”（太模糊，丢失了具体的‘接飞盘’动作） -> F。
+     - **留空**：该维度完全没有描述 -> F。
+
+---
+
+### 维度判定指南 ###
+
+- **Subject**: 正确的主体。
+- **Attributes**: 主要外观特征（如颜色或大致衣着）给 Y。完全没提特征给 F。
+- **Action**: 方向和状态正确给 Y。如果完全漏掉核心动作（如把“打篮球”写成“站着”）给 F。
+- **Environment**: 场景类型对（如“室内”vs“室外”）给 Y。
+- **Camera_Tech**: 运镜方向（推/拉/摇）。如果 GT 有明显运镜而 Pred 写 None，给 F。
+
+=== 标准参考 (GT) ===
+
+- 主体: {gt_subject}
+
+- 属性: {gt_attributes}
+
+- 动作: {gt_action}
+
+- 环境: {gt_environment_static}
+
+- 相机技术: {gt_camera_tech}
+
+- 背景: {gt_surroundings}
+
+- 摘要: {gt_summary}
+
+=== 待评估预测 (Pred) ===
+
+{pred_text}
+
+### 输出要求 ###
+请仅输出如下格式的 JSON 对象（每个值必须是单个字母 Y 或 N 或 F），不要输出 "Y/N/F"，不要带任何解释：
+{{"Subject":"","Attributes":"","Action":"","Environment":"","Camera_Tech":"","Surroundings":"","Summary":""}}"""
+#     prompt = f"""你是一个视频描述评估专家。
+
+# ### 判定逻辑 ###
+
+# 评估标准：检查 Pred 是否包含 GT 中提到的关键信息（主体、属性、动作、环境、相机技术、背景、摘要等）。
+
+# 1. 给 "Y" 的情况：只要 Pred 包含了 GT 中的任何关键信息，或者描述与 GT 在语义上相关，就应该给 Y。即使 Pred 只包含了 GT 中部分信息，也应该给 Y。
+
+# 2. 给 "N" 的情况：只有当 Pred 的描述与 GT 完全矛盾或明显错误时才给 N。例如 GT 说"A young woman"但 Pred 说"an old man"，或者 GT 说"indoors"但 Pred 说"outdoors"。轻微的差异或不同的表达方式不应该给 N。
+
+# 3. 给 "F" 的情况：只有当 Pred 完全遗漏了 GT 中的核心关键信息，且该信息是维度的重要特征时，才给 F。
+
+# 重要说明：
+# - 如果 GT 中的信息在 Pred 中以任何合理的表达方式出现（包括同义词、上位词、相关概念），应该给 Y。
+# - 只有在 Pred 完全没有任何相关信息时，才考虑给 F。如果不确定，优先给 Y。
+# - 对于属性（Attributes）维度：Pred 提到了主体的重要特征（如性别、服装等）且和GT一致，应该给 Y。
+# - 对于摘要（Summary）维度：只要 Pred 的整体描述与 GT 的摘要方向一致，给 Y。
+
+# === 标准参考 (GT) ===
+
+# - 主体: {gt_subject}
+
+# - 属性: {gt_attributes}
+
+# - 动作: {gt_action}
+
+# - 环境: {gt_environment_static}
+
+# - 相机技术: {gt_camera_tech}
+
+# - 背景: {gt_surroundings}
+
+# - 摘要: {gt_summary}
+
+# === 待评估预测 (Pred) ===
+
+# {pred_text}
+
+# ### 评估要求 ###
+# 遵循上述 Y/N/F 的定义。优先判定为 Y（只要包含相关信息就给 Y），只有在明显错误时给 N，完全缺失关键信息时才给 F。如果不确定，倾向于给 Y 而不是 F 或 N。
+
+# 请仅输出如下格式的 JSON 对象（每个值必须是单个字母 Y 或 N 或 F），不要输出 "Y/N/F"，不要带任何解释：
+# {{"Subject":"","Attributes":"","Action":"","Environment":"","Camera_Tech":"","Surroundings":"","Summary":""}}"""
+#     prompt = f"""You are a professional video description evaluation expert. Your task is to verify whether the Predicted Description (Pred) contains clues consistent with the Ground Truth (GT).
+
+# ### Evaluation Logic ###
+
+# 1. Assign "Y": When keywords in Pred semantically correspond to GT, or function as reasonable hypernyms of GT (e.g., using "vehicle" to describe a "car").
+# 2. Assign "N": When the Pred description is completely inconsistent or contradicts the GT.
+# 3. Assign "F": When the Pred description is incomplete, vague, or missing key information mentioned in the GT.
+
+# === Ground Truth (GT) ===
+# - Subject: {gt_subject}
+# - Attributes: {gt_attributes}
+# - Action: {gt_action}
+# - Environment: {gt_environment_static}
+# - Surroundings: {gt_surroundings}
+
+# === Predicted Description (Pred) ===
+# {pred_text}
+
+# ### Evaluation Requirements ###
+# Strictly follow the Y/N/F definitions above. If the Pred description is ambiguous or lacks critical details, lean towards assigning "F" rather than "Y".
+
+# Output ONLY a JSON object in the following format (each value must be a single letter: Y, N, or F). Do not include any explanations or extra text:
+# {{
+#   "Subject": "",
+#   "Attributes": "",
+#   "Action": "",
+#   "Environment": "",
+#   "Surroundings": "",
+# }}"""
+    return prompt
+
+def parse_evaluation_response(response_text: str) -> Optional[Dict[str, str]]:
+    """
+    解析LLM返回的JSON评估结果
+    
+    Args:
+        response_text: LLM返回的文本（应该是JSON格式）
+        
+    Returns:
+        字典，键为维度名称，值为Y/N/F，解析失败返回None
+    """
+    if not response_text:
+        return None
+    
+    required_dims = ["Subject", "Attributes", "Action", "Environment", "Camera_Tech", "Surroundings", "Summary"]
+    
+    # 方法1: 尝试直接解析JSON
+    try:
+        # 提取JSON部分（可能被其他文本包围）
+        json_match = re.search(r'\{[^{}]*\}', response_text)
+        if json_match:
+            json_str = json_match.group()
+            result = json.loads(json_str)
+            # 验证并规范化
+            normalized = {}
+            for dim in required_dims:
+                if dim in result:
+                    val = str(result[dim]).upper().strip()
+                    # 必须是单个字符 Y/N/F，拒绝 "Y/N/F" 这种占位符
+                    if val in ["Y", "N", "F"]:
+                        normalized[dim] = val
+                    # 如果不是单字符，不添加到结果中
+            if len(normalized) == 7:
+                return normalized
+    except:
+        pass
+    
+    # 方法2: 正则提取 "Key": "Y/N/F"
+    result = {}
+    for dim in required_dims:
+        # 匹配 "Subject": "Y" 或 "Subject":"Y" 或 Subject: Y
+        pattern = rf'["\']?{dim}["\']?\s*:\s*["\']?([YNFynf])["\']?'
+        match = re.search(pattern, response_text, re.IGNORECASE)
+        if match:
+            result[dim] = match.group(1).upper()
+    
+    if len(result) == 7:
+        return result
+    
+    # 方法3: 从文本中按顺序提取Y/N/F
+    all_scores = re.findall(r'\b([YNF])\b', response_text, re.IGNORECASE)
+    all_scores = [s.upper() for s in all_scores]
+    if len(all_scores) >= 7:
+        result = {required_dims[i]: all_scores[i] for i in range(7)}
+        return result
+    
+    return None
+
+def calculate_accuracy(scores: Dict[str, str]) -> float:
+    """
+    计算准确率：Accuracy = Y / (Y + N + F)
+    
+    Args:
+        scores: 包含各维度Y/N/F评分的字典
+        
+    Returns:
+        准确率（0-1之间的浮点数）
+    """
+    y_count = sum(1 for score in scores.values() if score == "Y")
+    total = len(scores)
+    
+    if total == 0:
+        return 0.0
+    
+    return y_count / total
+
+def evaluate_video(video_id: str, gt_data: Dict, pred_text: str) -> Dict:
+    """
+    评估单个视频
+    
+    Args:
+        video_id: 视频ID
+        gt_data: GT数据
+        pred_text: 预测文本
+        
+    Returns:
+        评估结果字典
+    """
+    # 构建prompt
+    prompt = build_evaluation_prompt(video_id, gt_data, pred_text)
+    
+    # 调用API
+    response = call_openai_api(prompt)
+    
+    if not response:
+        return {
+            "video_id": video_id,
+            "status": "error",
+            "error": "API调用失败",
+            "scores": None,
+            "accuracy": None
+        }
+    
+    # 解析结果
+    scores = parse_evaluation_response(response)
+    
+    if not scores:
+        return {
+            "video_id": video_id,
+            "status": "error",
+            "error": "解析评估结果失败",
+            "raw_response": response[:500],  # 保留前500字符用于调试
+            "scores": None,
+            "accuracy": None
+        }
+    
+    # 计算准确率
+    accuracy = calculate_accuracy(scores)
+    
+    return {
+        "video_id": video_id,
+        "status": "success",
+        "scores": scores,
+        "accuracy": accuracy,
+        "raw_response": response  # 保留原始响应用于调试
+    }
+
+def main():
+    """主函数"""
+    print("开始加载数据...")
+    
+    # 加载GT数据
+    with open(GT_FILE, 'r', encoding='utf-8') as f:
+        gt_data = json.load(f)
+    
+    # 加载预测数据
+    with open(PRED_FILE, 'r', encoding='utf-8') as f:
+        pred_data = json.load(f)
+    
+    print(f"GT数据包含 {len(gt_data)} 个视频")
+    print(f"预测数据包含 {len(pred_data)} 个视频")
+    
+    # 获取共同的视频ID
+    common_video_ids = set(gt_data.keys()) & set(pred_data.keys())
+    print(f"共同视频数量: {len(common_video_ids)}")
+    
+    if len(common_video_ids) == 0:
+        print("错误：没有找到共同的视频ID！")
+        return
+    
+    # 评估所有视频（使用多线程）
+    results = []
+    total = len(common_video_ids)
+    video_ids_list = sorted(common_video_ids)
+    
+    def evaluate_single_video(video_id: str, idx: int) -> Dict:
+        """评估单个视频的包装函数，用于多线程"""
+        result = evaluate_video(
+            video_id,
+            gt_data[video_id],
+            pred_data[video_id]
+        )
+        
+        # 添加GT和Pred信息到结果中
+        result["gt"] = gt_data[video_id]
+        result["pred"] = pred_data[video_id]
+        
+        # 线程安全的打印
+        with print_lock:
+            if result["status"] == "success":
+                print(f"[{idx}/{total}] {video_id}: 准确率={result['accuracy']:.4f}, 评分={result['scores']}")
+            else:
+                print(f"[{idx}/{total}] {video_id}: 错误 - {result.get('error', 'Unknown error')}")
+        
+        return result
+    
+    print(f"\n开始多线程评估（{MAX_WORKERS}个线程）...")
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # 提交所有任务
+        future_to_video = {
+            executor.submit(evaluate_single_video, video_id, idx): video_id 
+            for idx, video_id in enumerate(video_ids_list, 1)
+        }
+        
+        # 收集结果（按完成顺序）
+        for future in as_completed(future_to_video):
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                video_id = future_to_video[future]
+                with print_lock:
+                    print(f"视频 {video_id} 评估时发生异常: {e}")
+                results.append({
+                    "video_id": video_id,
+                    "status": "error",
+                    "error": f"评估异常: {str(e)}",
+                    "scores": None,
+                    "accuracy": None,
+                    "gt": gt_data.get(video_id, {}),
+                    "pred": pred_data.get(video_id, "")
+                })
+    
+    # 按video_id排序结果，保持一致性
+    results.sort(key=lambda x: x["video_id"])
+    
+    # 计算统计信息
+    successful_results = [r for r in results if r["status"] == "success"]
+    failed_results = [r for r in results if r["status"] == "error"]
+    
+    print(f"\n=== 评估完成 ===")
+    print(f"成功: {len(successful_results)}")
+    print(f"失败: {len(failed_results)}")
+    
+    # 计算平均准确率
+    avg_accuracy = None
+    overall_avg_y_rate = None
+    if successful_results:
+        avg_accuracy = sum(r["accuracy"] for r in successful_results) / len(successful_results)
+        print(f"平均准确率: {avg_accuracy:.4f}")
+        
+        # 计算各维度的Y/N/F统计（7个维度）
+        dimension_stats = {
+            "Subject": {"Y": 0, "N": 0, "F": 0},
+            "Attributes": {"Y": 0, "N": 0, "F": 0},
+            "Action": {"Y": 0, "N": 0, "F": 0},
+            "Environment": {"Y": 0, "N": 0, "F": 0},
+            "Camera_Tech": {"Y": 0, "N": 0, "F": 0},
+            "Surroundings": {"Y": 0, "N": 0, "F": 0},
+            "Summary": {"Y": 0, "N": 0, "F": 0},
+        }
+        
+        for result in successful_results:
+            for dim, score in result["scores"].items():
+                if dim in dimension_stats and score in dimension_stats[dim]:
+                    dimension_stats[dim][score] += 1
+        
+        print("\n=== 各维度统计 ===")
+        dimension_y_rates = {}
+        for dim, stats in dimension_stats.items():
+            total_dim = sum(stats.values())
+            y_rate = stats["Y"] / total_dim if total_dim > 0 else 0
+            dimension_y_rates[dim] = y_rate
+            print(f"{dim}: Y={stats['Y']} N={stats['N']} F={stats['F']} (Y率: {y_rate:.4f})")
+        
+        # 计算总体平均Y率
+        if dimension_y_rates:
+            overall_avg_y_rate = sum(dimension_y_rates.values()) / len(dimension_y_rates)
+            print(f"\n=== 总体平均Y率 ===")
+            print(f"所有维度平均Y率: {overall_avg_y_rate:.4f}")
+    
+    # 保存结果
+    output = {
+        "summary": {
+            "total_videos": total,
+            "successful": len(successful_results),
+            "failed": len(failed_results),
+            "average_accuracy": avg_accuracy,
+            "overall_avg_y_rate": overall_avg_y_rate,
+            "dimension_rates": dimension_y_rates,
+        },
+        "results": results
+    }
+    
+    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+    
+    print(f"\n结果已保存到: {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    main()
+
