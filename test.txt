@@ -1,1 +1,35 @@
 镜头采用流畅的跟拍方式，从滑雪者右后方进行跟随拍摄，一名滑雪者在阳光照耀的雪坡上滑降，背景中洪峰巍然矗立，头顶是澄澈无云的湛蓝天空。滑雪者身着深色滑雪服、头戴黑色头盔，在修整平整的白雪雪道上节奏稳健、动作精准地站立滑行。随着视频推进，滑雪者在雪道上划出平缓的弧线，身体随后半蹲，滑雪杖张开以保持平衡。阳光照亮雪面的纹理，整体氛围明亮而清爽。雪道左侧设有由细绳索的安全边界，顺着山体轮廓延伸。滑雪者保持匀速，身姿流畅地朝着镜头远处的宽阔白色山谷滑去。富有节奏的滑雪动作与静穆雄伟的群山相映，呈现出一幅高海拔地区冬季运动的和谐画面。……
+
+We are working on a project that involves generating captions for videos and using these captions to reconstruct the videos. The process follows these steps:  
+
+1. **Original Video (First Video):** A caption is generated based on this video.  
+2. **Reconstructed Video (Second Video):** The generated caption is used as input for a text-to-video model to create this video.  
+
+### **Your Task**  
+Compare the **original** and **reconstructed** videos, analyzing their differences to identify potential improvements for the original caption. Based on your observations, provide a **revised caption** that could enhance the reconstruction quality. 
+
+### **Guidelines for Comparison**  
+When analyzing the differences between the two videos, consider the following aspects:  
+
+- **Visual Details:** Color, shape, texture, and material of objects.  
+- **Composition & Layout:** Object positioning, spatial relationships, and overall scene structure.  
+- **Human Attributes (if applicable):** Pose, facial expression, skin tone, clothing, and hairstyle.  
+- **Human Actions (if applicable):** Hand movements, body movements.  
+- **Perspective & Style:** Type of video, camera angle, depth of field, lighting, and artistic style.  
+- **Video Quality:** Blurriness, artifacts, or inconsistencies in object rendering.  
+- **World Knowledge:** Proper nouns or specific real-world references that should be preserved.  
+- **Color Aesthetics:** Color palette, grading, and overall mood consistency.  
+
+---
+
+### **How to Improve the Caption**  
+- **Add missing details** that were lost in reconstruction.  
+- **Clarify ambiguous descriptions** to provide more precise information.  
+- **Correct any inaccuracies** based on observed differences.  
+- **Specify key attributes** (e.g., `"a red leather couch"` instead of `"a couch"`).  
+
+Your revised caption should aim to **reduce discrepancies** between the original and reconstructed videos while maintaining a natural and informative description. Your are encouraged to make revised caption less than 512 tokens.
+
+Now I provide the original video, reconstructed video and the original caption: {orig_caption}.
+
+Please give me the revised caption that you believe could enhance the reconstruction quality (namely, make the new reconstructed video more like the original one at pixel level) enclosed with <revised caption>. And provide your analysis enclosed with <analysis> after.
