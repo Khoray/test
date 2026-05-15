@@ -157,3 +157,43 @@ def inference_with_openai_api_single(
 
     return idx, completion.choices[0].message.content
 
+
+import json
+import pathos
+import os
+from tqdm import tqdm
+from post_vllm_infer_qwen3 import inference_with_openai_api_single
+
+pool = pathos.multiprocessing.ProcessPool(nodes=16)
+
+datasets = [
+    '/data/hwx1479485/HOI/videos_HOI_subset',
+    '/data/hwx1479485/videos/20260114_human_action',
+    '/data/hwx1479485/videos/20260126_2.6.1.seedance.1.tarsier2',
+    '/data/hwx1479485/videos/DREAM-1K_videos',
+]
+
+INFER_PROMPT = "Describe this video in detail."
+
+base_dir = "captions"
+
+for dataset in datasets:
+    print(f"processing: {dataset}")
+    dataset_name = dataset.split("/")[-1]
+    os.makedirs(f"{base_dir}/{dataset_name}", exist_ok=True)
+    old_videos = []
+    prompts = []
+    ids = []
+    for video_name in os.listdir(dataset):
+        if os.path.exists(f"{base_dir}/{dataset_name}/{video_name}.txt"):
+            continue
+        old_videos.append("file://" + (os.path.join(dataset, video_name)))
+        prompts.append(INFER_PROMPT)
+        ids.append(video_name)
+
+    results = pool.imap(inference_with_openai_api_single, old_videos, prompts, ids)
+    pbar = tqdm(total=len(prompts))
+    for video, res in results:
+        with open(f"{base_dir}/{dataset_name}/{video}.txt", "w") as f:
+            f.write(res)
+        pbar.update(1)
