@@ -1,51 +1,159 @@
-问题与挑战：
-模型细粒度caption能力不足：T2V的训练高度依赖视频与caption的精确对齐，目前模型的输出粒度不足，对视频的各个维度描述不全面不准确。
-评估标准不统一：传统指标难以评估开放式caption，现有的LLM评估方案无统一客观标准且评估维度不全面，一致性和稳定性差。
+from openai import OpenAI
+import os
+# DASH_MODEL_ID = "/data/hwx1479485/models/Qwen3-VL-32B-Instruct"
+# DASH_MODEL_ID = "/data/hwx1479485/project/sft_qwen/output/v3-20260401-183334/checkpoint-100"
+# DASH_MODEL_ID = "/data/hwx1479485/models/Qwen3-VL-8B-Instruct"
+DASH_MODEL_ID = "/data/hwx1479485/project/sft_qwen/output/v4-20260417-160203/checkpoint-100"
 
-专项训练模型细粒度caption能力并构建合理评估指标：
-通过“文本->视频重建->视频文本差异对比->描述修正”的双向语义对齐机制，构建高质量caption数据。通过这批数据微调模型后无需迭代推理即可生成高质量caption。
-提出多维度caption评估指标。
+PROMPT_v1 = """
+We are working on a project that involves generating captions for videos and using these captions to reconstruct the videos. The process follows these steps:  
+
+1. **Original Video (First Video):** A caption is generated based on this video.  
+2. **Reconstructed Video (Second Video):** The generated caption is used as input for a text-to-video model to create this video.  
+
+### **Your Task**  
+Compare the **original** and **reconstructed** videos, analyzing their differences to identify potential improvements for the original caption. Based on your observations, provide a **revised caption** that could enhance the reconstruction quality. 
+
+### **Guidelines for Comparison**  
+When analyzing the differences between the two videos, consider the following aspects:  
+
+- **Visual Details:** Color, shape, texture, and material of objects.  
+- **Composition & Layout:** Object positioning, spatial relationships, and overall scene structure.  
+- **Human Attributes (if applicable):** Pose, facial expression, skin tone, clothing, and hairstyle.  
+- **Human Actions (if applicable):** Hand movements, body movements.  
+- **Perspective & Style:** Type of video, camera angle, depth of field, lighting, and artistic style.  
+- **Video Quality:** Blurriness, artifacts, or inconsistencies in object rendering.  
+- **World Knowledge:** Proper nouns or specific real-world references that should be preserved.  
+- **Color Aesthetics:** Color palette, grading, and overall mood consistency.  
+
+---
+
+### **How to Improve the Caption**  
+- **Add missing details** that were lost in reconstruction.  
+- **Clarify ambiguous descriptions** to provide more precise information.  
+- **Correct any inaccuracies** based on observed differences.  
+- **Specify key attributes** (e.g., `"a red leather couch"` instead of `"a couch"`).  
+
+Your revised caption should aim to **reduce discrepancies** between the original and reconstructed videos while maintaining a natural and informative description. Your are encouraged to make revised caption less than 512 tokens.
+
+Now I provide the original video, reconstructed video and the original caption: {orig_caption}.
+
+Please give me the revised caption that you believe could enhance the reconstruction quality (namely, make the new reconstructed video more like the original one at pixel level) enclosed with <revised caption>. And provide your analysis enclosed with <analysis> after.
+"""
+
+PROMPT = """
+We are working on a project that involves generating captions for videos and using these captions to reconstruct the videos. The process follows these steps:  
+
+1. **Original Video (First Video):** A caption is generated based on this video.  
+2. **Reconstructed Video (Second Video):** The generated caption is used as input for a text-to-video model to create this video.  
+
+### **Your Task**  
+Compare the **original** and **reconstructed** videos, analyzing their differences to identify potential improvements for the original caption. Based on your observations, provide a **revised caption** that could enhance the reconstruction quality. 
+
+### **Guidelines for Comparison**  
+When analyzing the differences between the two videos, consider the following aspects:  
+
+- **Subject_Info**: The core objects in the scene.
+
+- **Attributes** (Static Properties): Connect features such as gender, clothing, appearance, or material and color into a fluent sentence.
+
+- **Environment_Static** (Environment): The background environment, lighting, and atmosphere (e.g., outdoor grass, soft lighting).
+
+- **Camera_Tech** (Filming Technique): Camera language such as focus, bokeh (blur), zoom, etc.
+
+- **Surroundings** (Surrounding Items): Specific props held by or near the subject (e.g., book, mobile phone).
+
+- **Action** (Core Action): The specific dynamics of the subjects.
+
+---
+
+### **How to Improve the Caption**  
+- **Add missing details** that were lost in reconstruction.  
+- **Clarify ambiguous descriptions** to provide more precise information.  
+- **Correct any inaccuracies** based on observed differences.  
+- **Specify key attributes** (e.g., `"a red leather couch"` instead of `"a couch"`).  
+
+Your revised caption should aim to **reduce discrepancies** between the original and reconstructed videos while maintaining a natural and informative description. Your are encouraged to make revised caption less than 512 tokens.
+
+Now I provide the original video, reconstructed video and the original caption: {orig_caption}.
+
+Please give me the revised caption that you believe could enhance the reconstruction quality (namely, make the new reconstructed video more like the original one at pixel level) enclosed with <revised caption>. And provide your analysis enclosed with <analysis> after.
+"""
 
 
+def inference_with_openai_api(
+    video1,
+    video2,
+    prompt,
+    idx="test.mp4",
+    model_id = DASH_MODEL_ID,
+    video_type='url'
+):
+    video1_msg = {"type": "video_url", "video_url": {"url": video1}}
+    video2_msg = {"type": "video_url", "video_url": {"url": video2}}
+    
+    client = OpenAI(
+        api_key = "",
+        base_url = "http://localhost:8015/v1",
+    )    
+    messages = [
+        {
+            "role": "system",
+            "content": "You are an expert Video Description Specialist. Your task is to generate highly detailed, professional, and visually evocative captions for video content."
+        },
+        {
+            "role": "user",
+            "content": [
+                video1_msg,
+                video2_msg,
+                {"type": "text", "text": prompt},
+            ]
+        }
+    ]
+    completion = client.chat.completions.create(
+        model = model_id,
+        messages = messages,
+        max_tokens = 10000,
+        extra_body={"mm_processor_kwargs": {"fps": 8, "do_sample_frames": True, "max_pixels": 460800}}
+    )
+    return idx, completion.choices[0].message.content
 
-评估数据集构建
-收集业界开源和华为内部的以人物为中心的视频数据集，利用Gemini-3-Pro自动化打标并且对测试集进行人工校验。作为内部验收数据集。
+def inference_with_openai_api_single(
+    video1,
+    prompt,
+    idx="test.mp4",
+    model_id = DASH_MODEL_ID,
+    video_type='url'
+):
+    video1_msg = {"type": "video_url", "video_url": {"url": video1}}
+    
+    client = OpenAI(
+        api_key = "",
+        base_url = "http://localhost:8015/v1",
+    )    
+    messages = [
+        {
+            "role": "system",
+            "content": ""
+        },
+        {
+            "role": "user",
+            "content": [
+                video1_msg,
+                {"type": "text", "text": prompt},
+            ]
+        }
+    ]
+    try:
+        completion = client.chat.completions.create(
+            model = model_id,
+            messages = messages,
+            max_tokens = 10000,
+            extra_body={"mm_processor_kwargs": {"fps": 2, "do_sample_frames": True, "max_pixels": 460800}}
+        )
+    except Exception as e:
+        print(f"{e}")
+        return idx, ""
 
-验收评估指标
+    return idx, completion.choices[0].message.content
 
-(1) Subject_Info (主体识别)
-维度内容：明确列出场景中的核心对象。
-(2) Attributes (静态属性)
-维度内容：主体的外观特征。
-逻辑检查点：
-人类：性别、年龄、种族 (race)、发型、体型、衣着（类型/图案/颜色）。
-物体/动物：颜色、形状、材质、物理状态。
-(3) Environment_Static (环境氛围)
-维度内容：背景环境、光照、氛围。
-(4) Camera_Tech (镜头语言)
-维度内容：拍摄技术与运镜方式。
-示例：聚焦 (focus)、虚化 (bokeh)、变焦 (zoom)、推拉摇移等。
-(5) Surroundings (周边物品)
-维度内容：与主体互动或位于主体附近的具体道具。
-(6) Action (动态行为)
-维度内容：主体的具体动作和状态。
-逻辑检查点：身体姿态、运动轨迹、交互行为。
-(7) Summary (一句话总结)
-维度内容：对整个事件的高度概括。
-
-利用本地部署的 LLM / 人工对每个维度进行校验：
-Y 表示描述准确完整、N 表示描述错误、 F 表示描述不完整
-
-准确率 = Y/(Y+N+F)
-
-
-
-Caption数据集构建方案消融-视觉重建模型
-利用Qwen3-VL-8B生成初始描述，在小规模测试数据（100条左右人物动作视频）下探索视觉重建模型、视觉重建质量对初始描述完善修正的效果。模型参数量、重建视频分辨率、step数对生成质量会产生影响，最终导致caption修正效果受到影响。
-
-
-
-
-
-Caption数据集构建方案消融-多阶段描述修正
-利用Qwen3-VL-32B和Wan2.1-14B重建视频后，在小规模测试数据（100条左右人物动作视频）下探索描述修正 Stage2 对最终结果影响。利用合理采帧方式针对动作进行修正对指标有收益。
